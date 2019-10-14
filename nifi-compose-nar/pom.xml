@@ -34,7 +34,6 @@
         <dependency>
             <groupId>com.compose.nifi</groupId>
             <artifactId>nifi-compose-processors</artifactId>
-            <version>${parent.version}</version>
         </dependency>
     </dependencies>
 
