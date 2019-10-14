@@ -2,3 +2,4 @@
 *.iml
 target/
 release.properties
+deploy.sh
