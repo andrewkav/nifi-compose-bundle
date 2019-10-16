@@ -16,15 +16,11 @@
  */
 package com.compose.nifi.processors;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.Charset;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.MongoCollection;
 import org.apache.nifi.annotation.behavior.EventDriven;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
@@ -44,15 +40,13 @@ import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.stream.io.StreamUtils;
 import org.bson.Document;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonParser;
-
-import com.mongodb.WriteConcern;
-import com.mongodb.client.MongoCollection;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.Charset;
+import java.util.*;
 
 @EventDriven
-@Tags({ "mongodb", "batch insert", "batch update", "write", "put" })
+@Tags({"mongodb", "batch insert", "batch update", "write", "put"})
 @InputRequirement(Requirement.INPUT_REQUIRED)
 @CapabilityDescription("Writes the json array contents of a FlowFile to MongoDB")
 public class ComposeBatchPutMongo extends AbstractProcessor {
@@ -69,12 +63,12 @@ public class ComposeBatchPutMongo extends AbstractProcessor {
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
     private static final PropertyDescriptor CHARACTER_SET = new PropertyDescriptor.Builder()
-        .name("Character Set")
-        .description("The Character Set in which the data is encoded")
-        .required(true)
-        .addValidator(StandardValidators.CHARACTER_SET_VALIDATOR)
-        .defaultValue("UTF-8")
-        .build();
+            .name("Character Set")
+            .description("The Character Set in which the data is encoded")
+            .required(true)
+            .addValidator(StandardValidators.CHARACTER_SET_VALIDATOR)
+            .defaultValue("UTF-8")
+            .build();
 
     private static final Set<Relationship> relationships;
     private static final List<PropertyDescriptor> propertyDescriptors;
@@ -138,10 +132,10 @@ public class ComposeBatchPutMongo extends AbstractProcessor {
             ArrayList<Document> docs = new ArrayList<>();
             JsonParser parser = new JsonParser();
             JsonArray array = parser.parse(new String(content, charset)).getAsJsonArray();
-            for(JsonElement element: array) {
-              //Terrible. surely a better way. learn more.
-              Document doc = Document.parse(element.toString());
-              docs.add(doc);
+            for (JsonElement element : array) {
+                //Terrible. surely a better way. learn more.
+                Document doc = Document.parse(element.toString());
+                docs.add(doc);
             }
 
             collection.insertMany(docs);
@@ -149,7 +143,7 @@ public class ComposeBatchPutMongo extends AbstractProcessor {
             session.getProvenanceReporter().send(flowFile, mongoWrapper.getURI(context));
             session.transfer(flowFile, REL_SUCCESS);
         } catch (Exception e) {
-            getLogger().error("Failed to insert {} into MongoDB due to {}", new Object[] {flowFile, e}, e);
+            getLogger().error("Failed to insert {} into MongoDB due to {}", new Object[]{flowFile, e}, e);
             session.transfer(flowFile, REL_FAILURE);
             context.yield();
         }
