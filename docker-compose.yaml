@@ -1,0 +1,11 @@
+version: "3.3"
+
+services:
+  mongo:
+    image: mongo:3.6.14-xenial
+    network_mode: host
+    restart: always
+    entrypoint: [ "/usr/bin/mongod", "--bind_ip_all", "--replSet", "rs0" ]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: password

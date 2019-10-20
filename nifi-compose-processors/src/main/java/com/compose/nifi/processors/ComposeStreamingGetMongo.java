@@ -4,21 +4,20 @@ import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoIterable;
-import com.mongodb.client.model.Filters;
-import com.mongodb.client.model.Sorts;
-import org.apache.commons.io.IOUtils;
-import org.apache.nifi.annotation.behavior.*;
+import org.apache.nifi.annotation.behavior.InputRequirement;
+import org.apache.nifi.annotation.behavior.TriggerSerially;
+import org.apache.nifi.annotation.behavior.WritesAttribute;
+import org.apache.nifi.annotation.behavior.WritesAttributes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
-import org.apache.nifi.annotation.lifecycle.OnStopped;
+import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
 import org.apache.nifi.components.PropertyDescriptor;
-import org.apache.nifi.components.Validator;
-import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.processor.*;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
-import org.apache.nifi.processor.io.OutputStreamCallback;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.bson.Document;
 import org.bson.types.ObjectId;
@@ -44,24 +43,13 @@ import java.util.regex.Pattern;
         @WritesAttribute(attribute = "mongo.collection", description = "The MongoDB collection")
 })
 @CapabilityDescription("Streams documents from collection(s) instead of waiting for query to finish before next step.")
-@Stateful(description = "Can store and track the latest seen value of index column", scopes = Scope.LOCAL)
-public class ComposeStreamingGetMongo extends AbstractSessionFactoryProcessor {
-
-
+public class ComposeStreamingGetMongo extends AbstractMongoProcessor {
     private static final PropertyDescriptor COLLECTION_REGEX = new PropertyDescriptor.Builder()
             .name("Mongo Collection Regex")
             .description("The regex to match collections. Uses java.util regexes. The default of '.*' matches all collections")
             .required(true)
             .defaultValue(".*")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-            .build();
-
-    private static final PropertyDescriptor COLLECTION_INCREMENT_FIELD = new PropertyDescriptor.Builder()
-            .name("Increment field")
-            .required(true)
-            .defaultValue(".*")
-            .addValidator(Validator.VALID)
-            .description("The field is used for incremental fetching")
             .build();
 
     private final static Relationship REL_SUCCESS = new Relationship.Builder().name("success").description("All good documents go this way").build();
@@ -95,9 +83,9 @@ public class ComposeStreamingGetMongo extends AbstractSessionFactoryProcessor {
 
     static {
         List<PropertyDescriptor> _propertyDescriptors = new ArrayList<>();
-        _propertyDescriptors.addAll(MongoWrapper.descriptors);
+        _propertyDescriptors.addAll(descriptors);
         _propertyDescriptors.add(COLLECTION_REGEX);
-        _propertyDescriptors.add(COLLECTION_INCREMENT_FIELD);
+        _propertyDescriptors.add(JSON_TYPE);
         propertyDescriptors = Collections.unmodifiableList(_propertyDescriptors);
 
         final Set<Relationship> _relationships = new HashSet<>();
@@ -106,9 +94,6 @@ public class ComposeStreamingGetMongo extends AbstractSessionFactoryProcessor {
     }
 
     private Pattern userCollectionNamePattern;
-    private String incrementalField;
-
-    private MongoWrapper mongoWrapper;
 
     @Override
     public Set<Relationship> getRelationships() {
@@ -120,66 +105,50 @@ public class ComposeStreamingGetMongo extends AbstractSessionFactoryProcessor {
         return propertyDescriptors;
     }
 
+    @OnUnscheduled
+    public final void interruptMainProcessorThread() {
+        closeClient();
+    }
+
     @OnScheduled
     public final void initPattern(ProcessContext context) {
         userCollectionNamePattern = Pattern.compile(context.getProperty(COLLECTION_REGEX).getValue());
-        incrementalField = context.getProperty(COLLECTION_INCREMENT_FIELD).getValue();
-    }
-
-    @OnScheduled
-    public final void createClient(ProcessContext context) throws IOException {
-        mongoWrapper = new MongoWrapper();
-        mongoWrapper.createClient(context);
     }
 
 
-    @OnStopped
-    public final void closeClient() {
-        mongoWrapper.closeClient();
-    }
-
-    private ArrayList<String> getUserCollectionNames(final ProcessContext context) {
+    private ArrayList<String> getUserCollectionNames(final String dbName) {
         ArrayList<String> userCollectionNames = new ArrayList<>();
-        MongoIterable<String> names = mongoWrapper.getDatabase(context).listCollectionNames();
+        MongoIterable<String> names = mongoClient.getDatabase(dbName).listCollectionNames();
         for (String name : names) {
             if (userCollectionNamePattern.matcher(name).matches()) {
                 userCollectionNames.add(name);
-                getLogger().debug("Adding collectionName: {} due to match of {}", new Object[]{name, context.getProperty(COLLECTION_REGEX).getValue()});
+                getLogger().debug("Adding collectionName: {} due to match of {}", new Object[]{name,});
             }
         }
         return userCollectionNames;
     }
 
-    @Override
-    public final void onTrigger(final ProcessContext context, final ProcessSessionFactory sessionFactory) {
-        for (String collectionName : getUserCollectionNames(context)) {
+    public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
+        final String jsonTypeSetting = context.getProperty(JSON_TYPE).getValue();
+        final String dbName = context.getProperty(DATABASE_NAME).getValue();
+        final String uri = context.getProperty(URI).getValue();
+
+        configureMapper(jsonTypeSetting, null);
+
+        for (String collectionName : getUserCollectionNames(dbName)) {
             if (MongoWrapper.systemIndexesPattern.matcher(collectionName).matches()) {
                 continue;
             }
 
-            final MongoCollection<Document> collection = mongoWrapper.getDatabase(context).getCollection(collectionName);
+            final MongoCollection<Document> collection = mongoClient.getDatabase(dbName).getCollection(collectionName);
 
             try {
-
-                FindIterable<Document> it = collection.find();
-                if (!incrementalField.isEmpty()) {
-                    it = collection.find().sort(Sorts.ascending(incrementalField));
-
-                    final String currentIncrementFieldValue = context.getStateManager().getState(Scope.LOCAL).get(incrementalField);
-                    if (currentIncrementFieldValue != null && !currentIncrementFieldValue.isEmpty()) {
-                        getLogger().info("incrementalField = {}, current value = {}", new Object[]{incrementalField, currentIncrementFieldValue});
-                        it = collection.find(Filters.gte(incrementalField, fromString(currentIncrementFieldValue))).sort(Sorts.ascending(incrementalField));
-                    }
-                }
-
+                final FindIterable<Document> it = collection.find();
+                it.batchSize(context.getProperty(BATCH_SIZE).asInteger());
                 final MongoCursor<Document> cursor = it.iterator();
-                final String dbName = mongoWrapper.getDatabase(context).getName();
 
-                Object lastDocIncrementalField = null;
                 try {
                     while (cursor.hasNext()) {
-                        ProcessSession session = sessionFactory.createSession();
-
                         FlowFile flowFile = session.create();
 
                         final Document currentDoc = cursor.next();
@@ -191,36 +160,25 @@ public class ComposeStreamingGetMongo extends AbstractSessionFactoryProcessor {
                         flowFile = session.putAttribute(flowFile, "mongo.db", dbName);
                         flowFile = session.putAttribute(flowFile, "mongo.collection", collectionName);
 
-                        flowFile = session.write(flowFile, new OutputStreamCallback() {
-                            @Override
-                            public void process(OutputStream out) throws IOException {
-                                IOUtils.write(currentDoc.toJson(), out, StandardCharsets.UTF_8);
+                        flowFile = session.write(flowFile, out -> {
+                            if (jsonTypeSetting.equals(JSON_TYPE_STANDARD)) {
+                                out.write(objectMapper.writer().writeValueAsString(currentDoc).getBytes(StandardCharsets.UTF_8));
+                            } else {
+                                out.write(currentDoc.toJson().getBytes(StandardCharsets.UTF_8));
                             }
                         });
 
-                        session.getProvenanceReporter().receive(flowFile, mongoWrapper.getURI(context));
+                        session.getProvenanceReporter().receive(flowFile, uri);
                         session.transfer(flowFile, REL_SUCCESS);
-                        if (incrementalField != null && !incrementalField.isEmpty()) {
-                            lastDocIncrementalField = currentDoc.get(incrementalField);
-                        }
                         session.commit();
                     }
                 } finally {
                     cursor.close();
                 }
-
-                if (incrementalField != null && !incrementalField.isEmpty()) {
-                    getLogger().info("updating state, obj.{} = {}", new Object[]{incrementalField, lastDocIncrementalField});
-
-                    context.getStateManager().setState(Collections.singletonMap(incrementalField, toString(lastDocIncrementalField)), Scope.LOCAL);
-                }
-
-
             } catch (final Throwable t) {
                 getLogger().error("{} failed to process due to {}; rolling back session", new Object[]{this, t});
                 throw new ProcessException(t);
             }
         }
-
     }
 }

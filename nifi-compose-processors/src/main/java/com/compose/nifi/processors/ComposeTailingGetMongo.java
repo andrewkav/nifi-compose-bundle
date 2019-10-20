@@ -5,28 +5,25 @@ import com.mongodb.CursorType;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
-import com.mongodb.client.MongoIterable;
-import org.apache.commons.io.IOUtils;
-import org.apache.nifi.annotation.behavior.InputRequirement;
-import org.apache.nifi.annotation.behavior.TriggerSerially;
-import org.apache.nifi.annotation.behavior.WritesAttribute;
-import org.apache.nifi.annotation.behavior.WritesAttributes;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.nifi.annotation.behavior.*;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
-import org.apache.nifi.annotation.lifecycle.OnStopped;
+import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.processor.*;
-import org.apache.nifi.processor.io.OutputStreamCallback;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.Relationship;
+import org.apache.nifi.processor.exception.ProcessException;
 import org.bson.BsonTimestamp;
 import org.bson.Document;
-import org.bson.types.ObjectId;
 
-import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import static com.mongodb.client.model.Filters.gt;
@@ -45,17 +42,23 @@ import static com.mongodb.client.model.Filters.gt;
         @WritesAttribute(attribute = "mongo.db", description = "The Mongo database name"),
         @WritesAttribute(attribute = "mongo.collection", description = "The Mongo collection name")
 })
+@Stateful(description = "Stores the timestamp of the latest OP log tx", scopes = Scope.LOCAL)
 @CapabilityDescription("Dumps documents from a MongoDB and then dumps operations from the oplog in soft real time. The FlowFile content is the document itself from the find or the `o` attribute from the oplog. It keeps a connection open and waits on new oplog entries. Restart does the full dump again and then oplog tailing.")
-public class ComposeTailingGetMongo extends AbstractSessionFactoryProcessor {
+public class ComposeTailingGetMongo extends AbstractMongoProcessor {
     private static final Relationship REL_SUCCESS = new Relationship.Builder().name("success").description("the happy path for mongo documents and operations").build();
 
     private static final Set<Relationship> relationships;
 
     private static final List<PropertyDescriptor> propertyDescriptors;
+    public static final String LATEST_TS = "latest_ts";
+
+    private boolean isRunning;
 
     static {
         List<PropertyDescriptor> _propertyDescriptors = new ArrayList<>();
-        _propertyDescriptors.addAll(MongoWrapper.descriptors);
+        _propertyDescriptors.addAll(descriptors);
+        _propertyDescriptors.add(JSON_TYPE);
+        _propertyDescriptors.add(BATCH_SIZE);
         propertyDescriptors = Collections.unmodifiableList(_propertyDescriptors);
 
         Set<Relationship> _relationships = new HashSet<>();
@@ -63,7 +66,6 @@ public class ComposeTailingGetMongo extends AbstractSessionFactoryProcessor {
         relationships = Collections.unmodifiableSet(_relationships);
     }
 
-    private MongoWrapper mongoWrapper;
 
     @Override
     public final Set<Relationship> getRelationships() {
@@ -75,98 +77,88 @@ public class ComposeTailingGetMongo extends AbstractSessionFactoryProcessor {
         return propertyDescriptors;
     }
 
-    @OnScheduled
-    public final void createClient(ProcessContext context) throws IOException {
-        mongoWrapper = new MongoWrapper();
-        mongoWrapper.createClient(context);
+    @OnUnscheduled
+    public final void stopMainProcessorThread() {
+        isRunning = false;
     }
 
-    @OnStopped
-    public final void closeClient() {
-        mongoWrapper.closeClient();
+    @OnScheduled
+    public final void setRunning() {
+        isRunning = true;
     }
 
     @Override
-    public final void onTrigger(final ProcessContext context, final ProcessSessionFactory sessionFactory) {
-        long ts = new Date().getTime();
-        BsonTimestamp bts = new BsonTimestamp((int) (new Date().getTime() / 1000), 0);
-        String dbName = mongoWrapper.getDatabase(context).getName();
-        MongoIterable<String> collectionNames = mongoWrapper.getDatabase(context).listCollectionNames();
-        for (String collectionName : collectionNames) {
-            if (MongoWrapper.systemIndexesPattern.matcher(collectionName).matches()) {
-                continue;
-            }
-            MongoCollection<Document> collection = mongoWrapper.getDatabase(context).getCollection(collectionName);
+    public final void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
+        final String jsonTypeSetting = context.getProperty(JSON_TYPE).getValue();
+        final String databaseName = context.getProperty(DATABASE_NAME).getValue();
+        final String uri = context.getProperty(URI).getValue();
 
-            try {
-                FindIterable<Document> it = collection.find();
-                MongoCursor<Document> cursor = it.iterator();
+        final Pattern collectionNamePattern = Pattern.compile(context.getProperty(COLLECTION_NAME).getValue());
 
-                try {
-                    while (cursor.hasNext()) {
-                        ProcessSession session = sessionFactory.createSession();
-                        FlowFile flowFile = session.create();
-                        Document currentDoc = cursor.next();
-                        //TODO when not object_id
-                        ObjectId currentObjectId = currentDoc.getObjectId("_id");
-                        flowFile = session.putAttribute(flowFile, "mime.type", "application/json");
-                        flowFile = session.putAttribute(flowFile, "mongo.id", currentObjectId.toHexString());
-                        flowFile = session.putAttribute(flowFile, "mongo.ts", bts.toString());
-                        flowFile = session.putAttribute(flowFile, "mongo.op", "q");
-                        flowFile = session.putAttribute(flowFile, "mongo.db", dbName);
-                        flowFile = session.putAttribute(flowFile, "mongo.collection", collectionName);
+        configureMapper(jsonTypeSetting, null);
 
-                        flowFile = session.write(flowFile, new OutputStreamCallback() {
-                            @Override
-                            public void process(OutputStream outputStream) throws IOException {
-                                IOUtils.write(currentDoc.toJson(), outputStream);
-                            }
-                        });
-                        session.getProvenanceReporter().receive(flowFile, mongoWrapper.getURI(context));
-                        session.transfer(flowFile, REL_SUCCESS);
-                        session.commit();
-                    }
-                } finally {
-                    cursor.close();
-                }
-            } catch (Throwable t) {
-                getLogger().error("{} failed to process due to {}; rolling back", new Object[]{this, t});
-                throw t;
-            }
-        }
+        BsonTimestamp bts = new BsonTimestamp(0, 0);
 
-        MongoCollection<Document> oplog = mongoWrapper.getLocalDatabase().getCollection("oplog.rs");
+        MongoCollection<Document> oplog = mongoClient.getDatabase("local").getCollection("oplog.rs");
         try {
-            FindIterable<Document> it = oplog.find(gt("ts", bts)).cursorType(CursorType.TailableAwait).oplogReplay(true).noCursorTimeout(true);
-            MongoCursor<Document> cursor = it.iterator();
+            String latestTs = context.getStateManager().getState(Scope.LOCAL).get(LATEST_TS);
+            int latestTsInt = 0;
+            if (StringUtils.isNumeric(latestTs)) {
+                latestTsInt = Integer.parseInt(latestTs);
+                bts = new BsonTimestamp(latestTsInt, 0);
+            }
+
+
+            final FindIterable<Document> it = oplog.find(gt("ts", bts)).cursorType(CursorType.TailableAwait).oplogReplay(true).maxAwaitTime(5, TimeUnit.SECONDS);
+            it.batchSize(context.getProperty(BATCH_SIZE).asInteger());
+            final MongoCursor<Document> cursor = it.iterator();
             try {
-                while (cursor.hasNext()) {
-                    ProcessSession session = sessionFactory.createSession();
-                    Document currentDoc = cursor.next();
-                    String[] namespace = currentDoc.getString("ns").split(Pattern.quote("."));
-                    if (dbName.equals(namespace[0])) {
+                Document currentDoc = cursor.tryNext();
+                int currentCount = 0;
+                for (; isRunning; currentDoc = cursor.tryNext(), currentCount++) {
+                    if (currentDoc == null) {
+                        getLogger().debug("no new documents found, reiterating");
+                        continue;
+                    }
+
+                    String[] namespace = currentDoc.getString("ns").split(Pattern.quote("."), 2);
+                    if (databaseName.equals(namespace[0]) && collectionNamePattern.matcher(namespace[1]).matches()) {
                         FlowFile flowFile = session.create();
-                        Document oDoc = currentDoc.get("o", Document.class);
-                        String h = Long.toString(currentDoc.getLong("h"));
+
                         flowFile = session.putAttribute(flowFile, "mime.type", "application/json");
                         flowFile = session.putAttribute(flowFile, "mongo.id", getId(currentDoc));
-                        flowFile = session.putAttribute(flowFile, "mongo.ts", currentDoc.get("ts", BsonTimestamp.class).toString());
                         flowFile = session.putAttribute(flowFile, "mongo.op", currentDoc.getString("op"));
-                        flowFile = session.putAttribute(flowFile, "mongo.db", dbName);
+                        flowFile = session.putAttribute(flowFile, "mongo.db", databaseName);
                         flowFile = session.putAttribute(flowFile, "mongo.collection", namespace[1]);
 
-                        flowFile = session.write(flowFile, new OutputStreamCallback() {
-                            @Override
-                            public void process(OutputStream outputStream) throws IOException {
-                                IOUtils.write(oDoc.toJson(), outputStream, StandardCharsets.UTF_8);
+                        final Document docRef = currentDoc;
+                        flowFile = session.write(flowFile, out -> {
+                            if (jsonTypeSetting.equals(JSON_TYPE_STANDARD)) {
+                                out.write(objectMapper.writer().writeValueAsString(docRef).getBytes(StandardCharsets.UTF_8));
+                            } else {
+                                out.write(docRef.toJson().getBytes(StandardCharsets.UTF_8));
                             }
                         });
-                        session.getProvenanceReporter().receive(flowFile, mongoWrapper.getURI(context));
+
+                        session.getProvenanceReporter().receive(flowFile, uri);
                         session.transfer(flowFile, REL_SUCCESS);
+
                         session.commit();
+
+                        latestTsInt = Math.max(latestTsInt, currentDoc.get("ts", BsonTimestamp.class).getTime());
+
+                        // periodically save latest_ts
+                        if (currentCount > 100) {
+                            currentCount = 0;
+                            getLogger().debug("saving new latest_ts = {}", new Object[]{latestTsInt});
+                            context.getStateManager().setState(Collections.singletonMap(LATEST_TS, Integer.valueOf(latestTsInt).toString()), Scope.LOCAL);
+                        }
                     }
                 }
             } finally {
+                getLogger().debug("saving new latest_ts = {}", new Object[]{latestTsInt});
+                context.getStateManager().setState(Collections.singletonMap(LATEST_TS, Integer.valueOf(latestTsInt).toString()), Scope.LOCAL);
+
                 cursor.close();
             }
         } catch (Throwable t) {
