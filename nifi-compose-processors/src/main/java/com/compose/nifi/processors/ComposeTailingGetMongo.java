@@ -112,8 +112,9 @@ public class ComposeTailingGetMongo extends AbstractMongoProcessor {
             final FindIterable<Document> it = oplog.find(gt("ts", bts)).cursorType(CursorType.TailableAwait).oplogReplay(true).maxAwaitTime(5, TimeUnit.SECONDS);
             it.batchSize(context.getProperty(BATCH_SIZE).asInteger());
             final MongoCursor<Document> cursor = it.iterator();
+            Document currentDoc = null;
             try {
-                Document currentDoc = cursor.tryNext();
+                currentDoc = cursor.tryNext();
                 int currentCount = 0;
                 for (; isRunning; currentDoc = cursor.tryNext(), currentCount++) {
                     if (currentDoc == null) {
@@ -155,6 +156,8 @@ public class ComposeTailingGetMongo extends AbstractMongoProcessor {
                         }
                     }
                 }
+            } catch (ProcessException pe) {
+                getLogger().error("unable to process the record, doc={}, error={}", new Object[]{currentDoc, pe});
             } finally {
                 getLogger().debug("saving new latest_ts = {}", new Object[]{latestTsInt});
                 context.getStateManager().setState(Collections.singletonMap(LATEST_TS, Integer.valueOf(latestTsInt).toString()), Scope.LOCAL);
@@ -171,7 +174,8 @@ public class ComposeTailingGetMongo extends AbstractMongoProcessor {
             case "i":
             case "d":
             case "u":
-                return doc.get("o", Document.class).getObjectId("_id").toHexString();
+                Document o = doc.get("o", Document.class);
+                return o != null && o.getObjectId("_id") != null ? o.getObjectId("_id").toHexString() : "NA";
             case "n":
             case "c":
                 return Long.toString(doc.getLong("h"));

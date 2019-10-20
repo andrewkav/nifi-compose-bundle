@@ -22,7 +22,6 @@ import org.apache.nifi.processor.util.StandardValidators;
 import org.bson.Document;
 import org.bson.types.ObjectId;
 
-import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.regex.Pattern;
@@ -58,34 +57,12 @@ public class ComposeStreamingGetMongo extends AbstractMongoProcessor {
 
     private final static List<PropertyDescriptor> propertyDescriptors;
 
-    /**
-     * Read the object from Base64 string.
-     */
-    private static Object fromString(String s) throws IOException,
-            ClassNotFoundException {
-        byte[] data = Base64.getDecoder().decode(s);
-        ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
-        Object o = ois.readObject();
-        ois.close();
-        return o;
-    }
-
-    /**
-     * Write the object to a Base64 string.
-     */
-    private static String toString(Object o) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        ObjectOutputStream oos = new ObjectOutputStream(baos);
-        oos.writeObject(o);
-        oos.close();
-        return Base64.getEncoder().encodeToString(baos.toByteArray());
-    }
-
     static {
         List<PropertyDescriptor> _propertyDescriptors = new ArrayList<>();
         _propertyDescriptors.addAll(descriptors);
         _propertyDescriptors.add(COLLECTION_REGEX);
         _propertyDescriptors.add(JSON_TYPE);
+        _propertyDescriptors.add(BATCH_SIZE);
         propertyDescriptors = Collections.unmodifiableList(_propertyDescriptors);
 
         final Set<Relationship> _relationships = new HashSet<>();
@@ -94,6 +71,7 @@ public class ComposeStreamingGetMongo extends AbstractMongoProcessor {
     }
 
     private Pattern userCollectionNamePattern;
+    private boolean isRunning;
 
     @Override
     public Set<Relationship> getRelationships() {
@@ -106,12 +84,13 @@ public class ComposeStreamingGetMongo extends AbstractMongoProcessor {
     }
 
     @OnUnscheduled
-    public final void interruptMainProcessorThread() {
-        closeClient();
+    public final void stopProcessor() {
+        isRunning = false;
     }
 
     @OnScheduled
     public final void initPattern(ProcessContext context) {
+        isRunning = true;
         userCollectionNamePattern = Pattern.compile(context.getProperty(COLLECTION_REGEX).getValue());
     }
 
@@ -148,7 +127,7 @@ public class ComposeStreamingGetMongo extends AbstractMongoProcessor {
                 final MongoCursor<Document> cursor = it.iterator();
 
                 try {
-                    while (cursor.hasNext()) {
+                    while (isRunning && cursor.hasNext()) {
                         FlowFile flowFile = session.create();
 
                         final Document currentDoc = cursor.next();
