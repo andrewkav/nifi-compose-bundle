@@ -20,7 +20,7 @@
     <parent>
         <groupId>com.compose.nifi</groupId>
         <artifactId>nifi-compose-bundle</artifactId>
-        <version>1.9.2</version>
+        <version>1.10.0</version>
     </parent>
 
     <artifactId>nifi-compose-processors</artifactId>
